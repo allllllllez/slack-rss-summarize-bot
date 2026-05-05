@@ -1,0 +1,20 @@
+{
+  "name": "slack-rss-summarize-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "RSSフィードを Claude Haiku 4.5 で日本語要約して Slack に投稿する GAS Bot",
+  "scripts": {
+    "login": "clasp login",
+    "create": "clasp create --type standalone --rootDir ./src --title slack-rss-summarize-bot",
+    "push": "clasp push",
+    "pull": "clasp pull",
+    "open": "clasp open",
+    "logs": "clasp logs"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.3.0"
+  },
+  "overrides": {
+    "uuid": "^14.0.0"
+  }
+}
