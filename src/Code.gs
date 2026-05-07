@@ -1,14 +1,18 @@
 /**
- * RSS → Claude Haiku 4.5 で日本語要約 → Slack 投稿
+ * RSS → Claude Haiku 4.5 で日本語要約 → Slack 投稿 (複数チャンネル対応)
  *
  * セットアップ:
  *   1. Anthropic Console (https://console.anthropic.com/) で API キーを発行
- *   2. Slack で Incoming Webhook を作成し URL を取得
+ *   2. Slack で投稿先チャンネルごとに Incoming Webhook を作成し URL を取得
  *   3. GAS のメニュー「プロジェクトの設定」→「スクリプト プロパティ」に登録:
- *      - ANTHROPIC_API_KEY  : sk-ant-...
- *      - SLACK_WEBHOOK_URL  : https://hooks.slack.com/services/...
- *      - FEED_URLS          : 改行区切りでフィードURLを列挙
- *        例) https://aws.amazon.com/jp/blogs/aws/feed/
+ *      - ANTHROPIC_API_KEY : sk-ant-...
+ *      - ROUTES            : 下記スキーマのJSON配列
+ *        [
+ *          {"name":"aws", "webhook":"https://hooks.slack.com/...", "feeds":["https://aws.amazon.com/jp/blogs/aws/feed/"]},
+ *          {"name":"sec", "webhook":"https://hooks.slack.com/...", "feeds":["https://www.jpcert.or.jp/rss/jpcert.rdf"]}
+ *        ]
+ *        - name は state キーに使うため [A-Za-z0-9_-]+ のみ
+ *        - 同じ feed を複数 route に入れると、それぞれ独立に投稿される
  *   4. main() に対して時間ベーストリガー(30分おき等)を設定
  *
  * セキュリティ方針:
@@ -19,49 +23,106 @@
  */
 
 const PROPS = PropertiesService.getScriptProperties();
-const STATE_KEY = 'last_seen_per_feed'; // フィードごとに最後に処理した guid を記録
+const ROUTES_KEY = 'ROUTES';
+const STATE_KEY = 'last_seen_per_route_feed'; // { routeName: { feedUrl: guid } }
+const ROUTE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const CLAUDE_MODEL = 'claude-haiku-4-5';
 
 function main() {
   const apiKey = PROPS.getProperty('ANTHROPIC_API_KEY');
-  const webhook = PROPS.getProperty('SLACK_WEBHOOK_URL');
-  const feeds = (PROPS.getProperty('FEED_URLS') || '')
-    .split('\n').map(s => s.trim()).filter(Boolean);
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY が未設定です');
 
-  if (!apiKey || !webhook || feeds.length === 0) {
-    throw new Error('スクリプトプロパティが未設定です');
-  }
+  const routes = parseRoutes_(PROPS.getProperty(ROUTES_KEY));
+  if (routes.length === 0) throw new Error('ROUTES が未設定または有効なrouteがありません');
 
   const state = JSON.parse(PROPS.getProperty(STATE_KEY) || '{}');
 
-  feeds.forEach(feedUrl => {
-    try {
-      const items = fetchFeedItems_(feedUrl).slice(0, 20); // 暴走防止
-      const lastSeen = state[feedUrl] || null;
-      const newItems = takeUntil_(items, it => it.guid === lastSeen);
+  routes.forEach(route => {
+    const routeState = state[route.name] || {};
+    route.feeds.forEach(feedUrl => {
+      try {
+        const items = fetchFeedItems_(feedUrl).slice(0, 20); // 暴走防止
+        const lastSeen = routeState[feedUrl] || null;
+        const newItems = takeUntil_(items, it => it.guid === lastSeen);
 
-      // 古い順に投稿
-      newItems.reverse().forEach(item => {
-        const summary = summarizeJa_(apiKey, item);
-        postSlack_(webhook, item, summary);
-        Utilities.sleep(500); // レート対策
-      });
+        // 古い順に投稿
+        newItems.reverse().forEach(item => {
+          const summary = summarizeJa_(apiKey, item);
+          postSlack_(route.webhook, item, summary);
+          Utilities.sleep(500); // レート対策
+        });
 
-      if (items.length > 0) state[feedUrl] = items[0].guid;
-    } catch (e) {
-      console.error(`feed失敗: ${feedUrl}: ${e}`);
-    }
+        if (items.length > 0) routeState[feedUrl] = items[0].guid;
+      } catch (e) {
+        console.error(`[${route.name}] feed失敗: ${feedUrl}: ${e}`);
+      }
+    });
+    state[route.name] = routeState;
   });
 
   PROPS.setProperty(STATE_KEY, JSON.stringify(state));
+}
+
+function parseRoutes_(raw) {
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('ROUTES のJSONパースに失敗: ' + e);
+  }
+  if (!Array.isArray(parsed)) throw new Error('ROUTES は配列である必要があります');
+
+  const out = [];
+  const seenNames = new Set();
+  parsed.forEach((r, i) => {
+    if (!r || typeof r !== 'object') {
+      console.warn(`ROUTES[${i}] がオブジェクトではないためskip`);
+      return;
+    }
+    const name = r.name;
+    const webhook = r.webhook;
+    const feeds = r.feeds;
+    if (typeof name !== 'string' || !ROUTE_NAME_RE.test(name)) {
+      console.warn(`ROUTES[${i}] name='${name}' は不正 (英数字 _ - のみ可) のためskip`);
+      return;
+    }
+    if (seenNames.has(name)) {
+      console.warn(`ROUTES[${i}] name='${name}' が重複しているためskip`);
+      return;
+    }
+    if (typeof webhook !== 'string' || !webhook) {
+      console.warn(`ROUTES[${i}] (${name}) webhookが空のためskip`);
+      return;
+    }
+    if (!Array.isArray(feeds)) {
+      console.warn(`ROUTES[${i}] (${name}) feedsが配列ではないためskip`);
+      return;
+    }
+    const cleanFeeds = feeds.filter(f => typeof f === 'string' && f);
+    if (cleanFeeds.length === 0) {
+      console.warn(`ROUTES[${i}] (${name}) 有効なfeedが無いためskip`);
+      return;
+    }
+    seenNames.add(name);
+    out.push({ name: name, webhook: webhook, feeds: cleanFeeds });
+  });
+  return out;
 }
 
 function fetchFeedItems_(url) {
   const xml = UrlFetchApp.fetch(url, { muteHttpExceptions: true }).getContentText();
   const doc = XmlService.parse(xml);
   const root = doc.getRootElement();
-  // RSS 2.0 を想定。Atom を混ぜる場合は分岐を足す。
+  const name = root.getName();
+  if (name === 'rss') return parseRss2_(root);
+  if (name === 'feed') return parseAtom_(root);
+  throw new Error(`未対応のフィード形式: ルート要素=${name}`);
+}
+
+function parseRss2_(root) {
   const channel = root.getChild('channel');
+  if (!channel) throw new Error('RSS: channel要素が見つかりません');
   const items = channel.getChildren('item');
   const content = XmlService.getNamespace('content', 'http://purl.org/rss/1.0/modules/content/');
   return items.map(it => ({
@@ -72,6 +133,41 @@ function fetchFeedItems_(url) {
     description: text_(it.getChild('description')),
     body: text_(it.getChild('encoded', content)) || text_(it.getChild('description')),
   }));
+}
+
+function parseAtom_(root) {
+  const atom = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+  const entries = root.getChildren('entry', atom);
+  return entries.map(e => {
+    const link = pickAtomLink_(e.getChildren('link', atom));
+    const id = text_(e.getChild('id', atom));
+    const title = text_(e.getChild('title', atom));
+    const updated = text_(e.getChild('updated', atom));
+    const published = text_(e.getChild('published', atom));
+    const content = text_(e.getChild('content', atom));
+    const summary = text_(e.getChild('summary', atom));
+    return {
+      title: title,
+      link: link,
+      guid: id || link,
+      pubDate: published || updated,
+      description: summary,
+      body: content || summary,
+    };
+  });
+}
+
+// Atomの<link>はrel/href属性を持つ。rel未指定 or rel="alternate" を優先。
+function pickAtomLink_(links) {
+  if (!links || links.length === 0) return '';
+  let chosen = null;
+  for (let i = 0; i < links.length; i++) {
+    const rel = links[i].getAttribute('rel');
+    if (rel === null || rel.getValue() === 'alternate') { chosen = links[i]; break; }
+  }
+  if (!chosen) chosen = links[0];
+  const href = chosen.getAttribute('href');
+  return href ? href.getValue() : '';
 }
 
 function text_(el) { return el ? el.getText() : ''; }

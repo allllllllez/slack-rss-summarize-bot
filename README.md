@@ -61,15 +61,39 @@ npm run push
 | キー | 値 |
 | --- | --- |
 | `ANTHROPIC_API_KEY` | [Anthropic Console](https://console.anthropic.com/) で発行したキー (`sk-ant-…`) |
-| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL |
-| `FEED_URLS` | 改行区切りでフィード URL を列挙 |
+| `ROUTES` | 投稿先チャンネルとフィード URL を紐付ける JSON 配列（下記参照） |
 
-`FEED_URLS` の例:
+`ROUTES` の例:
 
+```json
+[
+  {
+    "name": "aws",
+    "webhook": "https://hooks.slack.com/services/AAA/BBB/CCC",
+    "feeds": [
+      "https://aws.amazon.com/jp/blogs/aws/feed/",
+      "https://aws.amazon.com/jp/blogs/security/feed/"
+    ]
+  },
+  {
+    "name": "sec",
+    "webhook": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
+    "feeds": [
+      "https://www.jpcert.or.jp/rss/jpcert.rdf"
+    ]
+  }
+]
 ```
-https://aws.amazon.com/jp/blogs/aws/feed/
-https://example.com/another-feed.xml
-```
+
+各 route の役割:
+
+| フィールド | 説明 |
+| --- | --- |
+| `name` | state キーに使う識別子。`[A-Za-z0-9_-]+` のみ。重複不可 |
+| `webhook` | 投稿先チャンネルの Slack Incoming Webhook URL |
+| `feeds` | このチャンネルに流し込む RSS フィード URL の配列 |
+
+> 同じフィードを複数 route に登録した場合、それぞれ独立にstate管理されるため両方のチャンネルに投稿される。
 
 ### 6. 動作確認
 
@@ -88,9 +112,10 @@ GAS エディタ左メニューの「トリガー」→「トリガーを追加�
 ## 運用上のメモ
 
 - 既存の Slack 標準 RSS インテグレーションは、本 Bot の動作確認後に `/feed remove` で外す。
-- フィードを追加した直後は、そのフィードの最大 20 件が一気に流れる可能性あり。事前に `last_seen_per_feed` を初期化しておくと静かにスタートできる。
-- 失敗したフィードは GAS の実行ログに `feed失敗: ...` として残る。`npm run logs` で参照可。
-- Atom フィード（`<entry>` 要素）に対応するには `fetchFeedItems_` に分岐を追加。
+- フィードを追加した直後は、そのフィードの最大 20 件が一気に流れる可能性あり。事前に `last_seen_per_route_feed` を初期化しておくと静かにスタートできる。
+- 失敗したフィードは GAS の実行ログに `[<routeName>] feed失敗: ...` として残る。`npm run logs` で参照可。
+- RSS 2.0 と Atom の両方に対応（ルート要素 `<rss>` / `<feed>` で自動分岐）。それ以外の形式は `未対応のフィード形式: ...` で明示的に失敗する。
+- 全 route × 全 feed を 1 つの `main()` で順次処理するため、規模が大きくなり GAS 実行時間 6 分制限に近づいたら、route ごとにエントリ関数を分けてトリガーを別々に貼るのが逃げ道。
 
 ## セキュリティ方針
 
