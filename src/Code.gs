@@ -1,12 +1,12 @@
 /**
- * RSS → Claude Haiku 4.5 で日本語要約 → Slack 投稿 (複数チャンネル対応)
+ * RSS → Gemini 2.5 Flash で日本語要約 → Slack 投稿 (複数チャンネル対応)
  *
  * セットアップ:
- *   1. Anthropic Console (https://console.anthropic.com/) で API キーを発行
+ *   1. Google AI Studio (https://aistudio.google.com/) で API キーを発行
  *   2. Slack で投稿先チャンネルごとに Incoming Webhook を作成し URL を取得
  *   3. GAS のメニュー「プロジェクトの設定」→「スクリプト プロパティ」に登録:
- *      - ANTHROPIC_API_KEY : sk-ant-...
- *      - ROUTES            : 下記スキーマのJSON配列
+ *      - GEMINI_API_KEY : AIza...
+ *      - ROUTES         : 下記スキーマのJSON配列
  *        [
  *          {"name":"aws", "webhook":"https://hooks.slack.com/...", "feeds":["https://aws.amazon.com/jp/blogs/aws/feed/"]},
  *          {"name":"sec", "webhook":"https://hooks.slack.com/...", "feeds":["https://www.jpcert.or.jp/rss/jpcert.rdf"]}
@@ -18,7 +18,7 @@
  * セキュリティ方針:
  *   - シークレットはコードに直書きせず PropertiesService に格納
  *   - スクリプトの共有範囲は「自分のみ」
- *   - RSS本文はプロンプトインジェクション源として扱い、system で指示を固定
+ *   - RSS本文はプロンプトインジェクション源として扱い、systemInstruction で指示を固定
  *   - 外部URLへのfetchはRSSフィード自体に限定(本文展開は行わない)
  */
 
@@ -26,11 +26,11 @@ const PROPS = PropertiesService.getScriptProperties();
 const ROUTES_KEY = 'ROUTES';
 const STATE_KEY = 'last_seen_per_route_feed'; // { routeName: { feedUrl: guid } }
 const ROUTE_NAME_RE = /^[A-Za-z0-9_-]+$/;
-const CLAUDE_MODEL = 'claude-haiku-4-5';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 function main() {
-  const apiKey = PROPS.getProperty('ANTHROPIC_API_KEY');
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY が未設定です');
+  const apiKey = PROPS.getProperty('GEMINI_API_KEY');
+  if (!apiKey) throw new Error('GEMINI_API_KEY が未設定です');
 
   const routes = parseRoutes_(PROPS.getProperty(ROUTES_KEY));
   if (routes.length === 0) throw new Error('ROUTES が未設定または有効なrouteがありません');
@@ -194,43 +194,57 @@ function summarizeJa_(apiKey, item) {
     '出力はSlackのmrkdwn記法で行うこと: ' +
     '見出し記号(#)は使わず通常のテキストで書く。' +
     '太字は **text** ではなく *text* (アスタリスク1個)を使う。' +
-    '箇条書きは「- 」で始める。' +
     'コードブロックや絵文字、画像は不要。';
 
   const userText =
     `<article title="${escapeAttr_(item.title)}">\n${cleaned}\n</article>\n\n` +
     '上記を日本語で要約してください。';
 
-  const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+  const endpoint =
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent` +
+    `?key=${encodeURIComponent(apiKey)}`;
+
+  const res = UrlFetchApp.fetch(endpoint, {
     method: 'post',
     contentType: 'application/json',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
     payload: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 600,
-      temperature: 0.3,
-      system: systemText,
-      messages: [{ role: 'user', content: userText }],
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: 'user', parts: [{ text: userText }] }],
+      generationConfig: {
+        maxOutputTokens: 1024,
+        temperature: 0.3,
+        thinkingConfig: { thinkingBudget: 0 }, // Gemini 2.5 系のthinking無効化(要約に推論トークン不要)
+      },
     }),
     muteHttpExceptions: true,
   });
 
-  const data = JSON.parse(res.getContentText());
-  if (data.type === 'error' || data.error) {
-    const msg = (data.error && data.error.message) || res.getContentText();
-    throw new Error('Anthropic API: ' + msg);
+  const raw = res.getContentText();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('Gemini API: JSONパース失敗: ' + raw);
   }
-  if (!Array.isArray(data.content) || data.content.length === 0) {
-    throw new Error('Anthropic API: 応答に content がありません: ' + res.getContentText());
+  if (data.error) {
+    const msg = (data.error && data.error.message) || raw;
+    throw new Error('Gemini API: ' + msg);
   }
-  return data.content
-    .filter(block => block.type === 'text')
-    .map(block => block.text || '')
-    .join('\n')
-    .trim();
+  if (data.promptFeedback && data.promptFeedback.blockReason) {
+    throw new Error('Gemini API: プロンプトがブロックされました: ' + data.promptFeedback.blockReason);
+  }
+  if (!Array.isArray(data.candidates) || data.candidates.length === 0) {
+    throw new Error('Gemini API: 応答に candidates がありません: ' + raw);
+  }
+  const candidate = data.candidates[0];
+  if (candidate.finishReason && candidate.finishReason !== 'STOP') {
+    // MAX_TOKENS / SAFETY / RECITATION 等は途切れ出力なのでSlackに流さず例外で落とす
+    throw new Error('Gemini API: finishReason=' + candidate.finishReason + ' のため要約失敗');
+  }
+  const parts = (candidate.content && candidate.content.parts) || [];
+  const out = parts.map(p => p.text || '').join('\n').trim();
+  if (!out) throw new Error('Gemini API: 応答テキストが空です: ' + raw);
+  return out;
 }
 
 function postSlack_(webhook, item, summary) {
